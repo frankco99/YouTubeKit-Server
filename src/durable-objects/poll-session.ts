@@ -29,8 +29,8 @@ export class PollSessionObject extends DurableObject {
     this.phase = 'waiting_for_request';
 
     const fakeSocket = this.buildFakeWebSocket();
-    // Pass native fetch bound to globalThis — Cloudflare requires correct `this` reference
-    const service = new YouTubeService(videoId, fakeSocket, fetch.bind(globalThis));
+    // Watch fetches YouTube directly (preserves Vietnamese IP for geo-restricted content)
+    const service = new YouTubeService(videoId, fakeSocket);
     this.ctx.waitUntil(service.start());
 
     return new Response(null, { status: 204 });
