@@ -35,6 +35,7 @@ export default {
       }
 
       // --- HTTP Polling: POST /v1/poll/start (watchOS) ---
+      // Rate limit only on /start (one check per video lookup, not per poll cycle)
       if (url.pathname === '/v1/poll/start' && request.method === 'POST') {
          try {
             const decision = await checkRateLimit(appID, env);
