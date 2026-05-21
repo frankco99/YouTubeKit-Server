@@ -1,24 +1,23 @@
 import { DurableObject } from 'cloudflare:workers';
-import { PollSession, PollSessionState, PollRequest } from '../youtube/models/poll';
+import { PollSession, PollRequest } from '../youtube/models/poll';
 import { YouTubeService } from '../youtube/service';
 
-/**
- * PollSessionObject Durable Object
- * One instance per Apple Watch polling session, keyed by sessionId.
- */
 export class PollSessionObject extends DurableObject {
+
+  // In-memory state — lives for the duration of the DO instance
+  // (DO instances are kept alive as long as there's activity)
+  private phase: 'waiting_for_request' | 'pending_request' | 'waiting_for_response' | 'done' | 'error' = 'waiting_for_request';
+  private pendingRequest: PollRequest | null = null;
+  private result: any[] | null = null;
+  private errorMessage: string | null = null;
+  private pendingResponseResolvers = new Map<string, (msg: any) => void>();
+  private messageListeners = new Map<string, Set<(event: any) => void>>();
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-
-    if (url.pathname === '/start') {
-      return this.handleStart(request);
-    } else if (url.pathname === '/next') {
-      return this.handleNext();
-    } else if (url.pathname === '/respond') {
-      return this.handleRespond(request);
-    }
-
+    if (url.pathname === '/start') return this.handleStart(request);
+    if (url.pathname === '/next')  return this.handleNext();
+    if (url.pathname === '/respond') return this.handleRespond(request);
     return new Response('Not found', { status: 404 });
   }
 
@@ -27,48 +26,36 @@ export class PollSessionObject extends DurableObject {
     const videoId = url.searchParams.get('videoID');
     if (!videoId) return new Response('Missing videoID', { status: 400 });
 
-    // Initialize session state
-    const session: PollSession = {
-      sessionId: this.ctx.id.toString(),
-      videoId,
-      state: { phase: 'waiting_for_request' },
-      createdAt: Date.now(),
-    };
-    await this.ctx.storage.put('session', session);
+    this.phase = 'waiting_for_request';
 
-    // Start YouTubeService with fake WebSocket backed by this DO
     const fakeSocket = this.buildFakeWebSocket();
-    const service = new YouTubeService(videoId, fakeSocket);
+    // Pass native fetch — server fetches YouTube directly, no round-trip through Watch
+    const service = new YouTubeService(videoId, fakeSocket, fetch);
     this.ctx.waitUntil(service.start());
 
-    return Response.json({ session_id: this.ctx.id.toString() });
+    return new Response(null, { status: 204 });
   }
 
   private async handleNext(): Promise<Response> {
-    const deadline = Date.now() + 25_000;
+    const deadline = Date.now() + 50_000;
 
     while (Date.now() < deadline) {
-      const session = await this.ctx.storage.get<PollSession>('session');
-      if (!session) return new Response('Session not found', { status: 404 });
-
-      const state = session.state;
-
-      if (state.phase === 'pending_request') {
-        const message = { type: 'urlRequest', content: state.request };
-        session.state = { phase: 'waiting_for_response', requestId: state.request.id };
-        await this.ctx.storage.put('session', session);
-        return Response.json(message);
+      if (this.phase === 'pending_request' && this.pendingRequest) {
+        const request = this.pendingRequest;
+        this.pendingRequest = null;
+        this.phase = 'waiting_for_response';
+        return Response.json({ type: 'urlRequest', content: request });
       }
 
-      if (state.phase === 'done') {
-        return Response.json({ type: 'result', content: state.streams });
+      if (this.phase === 'done') {
+        return Response.json({ type: 'result', content: this.result });
       }
 
-      if (state.phase === 'error') {
-        return new Response(JSON.stringify({ type: 'error', message: state.message }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' },
-        });
+      if (this.phase === 'error') {
+        return new Response(
+          JSON.stringify({ type: 'error', message: this.errorMessage }),
+          { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
       }
 
       await sleep(200);
@@ -79,64 +66,58 @@ export class PollSessionObject extends DurableObject {
 
   private async handleRespond(request: Request): Promise<Response> {
     const body = await request.json() as any;
-    const session = await this.ctx.storage.get<PollSession>('session');
-    if (!session) return new Response('Session not found', { status: 404 });
 
-    if (session.state.phase !== 'waiting_for_response') {
+    if (this.phase !== 'waiting_for_response') {
       return new Response('Unexpected respond', { status: 409 });
     }
 
+    this.phase = 'waiting_for_request';
     this.pendingResponseResolvers.get(body.id)?.(body);
     this.pendingResponseResolvers.delete(body.id);
-
-    session.state = { phase: 'waiting_for_request' };
-    await this.ctx.storage.put('session', session);
 
     return new Response(null, { status: 204 });
   }
 
-  // - Fake WebSocket -
-
-  private pendingResponseResolvers = new Map<string, (msg: any) => void>();
-
   private buildFakeWebSocket(): WebSocket {
     const self = this;
-    const listeners = new Map<string, Set<(event: any) => void>>();
 
     const fakeSocket = {
       addEventListener(type: string, listener: (event: any) => void) {
-        if (!listeners.has(type)) listeners.set(type, new Set());
-        listeners.get(type)!.add(listener);
+        if (!self.messageListeners.has(type)) self.messageListeners.set(type, new Set());
+        self.messageListeners.get(type)!.add(listener);
       },
 
-      async send(data: string | ArrayBuffer) {
+      send(data: string | ArrayBuffer) {
         if (typeof data !== 'string') return;
 
         let parsed: any;
         try { parsed = JSON.parse(data); } catch { return; }
 
-        const session = await self.ctx.storage.get<PollSession>('session');
-        if (!session) return;
-
         if (parsed.type === 'urlRequest') {
-          session.state = { phase: 'pending_request', request: parsed.content as PollRequest };
-          await self.ctx.storage.put('session', session);
-
           const requestId: string = parsed.content.id;
+
+          // Surface to /next
+          self.pendingRequest = parsed.content as PollRequest;
+          self.phase = 'pending_request';
+
+          // When /respond delivers the response, fire it back to YouTubeService
           const responsePromise = new Promise<any>(resolve => {
             self.pendingResponseResolvers.set(requestId, resolve);
           });
 
           responsePromise.then(responseData => {
-            listeners.get('message')?.forEach(l => l({ data: JSON.stringify(responseData) }));
+            self.messageListeners.get('message')?.forEach(l =>
+              l({ data: JSON.stringify(responseData) })
+            );
           });
 
         } else if (parsed.type === 'result') {
-          session.state = { phase: 'done', streams: parsed.content };
-          await self.ctx.storage.put('session', session);
+          self.result = parsed.content;
+          self.phase = 'done';
+
         } else if (parsed.type === 'error') {
-          session.state = { phase: 'error', message: parsed.message ?? 'Unknown error' };
-          await self.ctx.storage.put('session', session);
+          self.errorMessage = parsed.message ?? 'Unknown error';
+          self.phase = 'error';
         }
       },
 
