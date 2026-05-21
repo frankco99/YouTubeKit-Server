@@ -34,9 +34,9 @@ export default {
          return new Response(null, { status: 101, webSocket: clientSock });
       }
 
-      // --- HTTP Polling: POST /v1/poll/start (watchOS) ---
-      // Rate limit only on /start (one check per video lookup, not per poll cycle)
-      if (url.pathname === '/v1/poll/start' && request.method === 'POST') {
+      // --- WebSocket polling: GET /v1/poll/ws (watchOS) ---
+      // Uses DO WebSocket hibernation — DO stays alive for entire session
+      if (url.pathname === '/v1/poll/ws' && request.headers.get('Upgrade') === 'websocket') {
          try {
             const decision = await checkRateLimit(appID, env);
             if (!decision.allowed) return buildRateLimitResponse(decision);
@@ -47,48 +47,20 @@ export default {
          const videoID = url.searchParams.get('videoID');
          if (!videoID) return new Response('Missing videoID', { status: 400 });
 
-         // Use a UUID as the DO name so we control the session_id format
+         // Each session gets its own DO instance
          const sessionId = crypto.randomUUID();
-         const doStub = getPollSession(env, sessionId);
+         const objectID = (env as any).POLL_SESSION.idFromName(sessionId);
+         const doStub = (env as any).POLL_SESSION.get(objectID);
 
-         const doUrl = `https://do/start?videoID=${encodeURIComponent(videoID)}`;
-         const resp = await doStub.fetch(new Request(doUrl, { method: 'POST' }));
-         if (!resp.ok) return resp;
-
-         // Return session_id to client (the UUID we generated)
-         return Response.json({ session_id: sessionId });
-      }
-
-      // --- HTTP Polling: GET /v1/poll/next (watchOS) ---
-      if (url.pathname === '/v1/poll/next' && request.method === 'GET') {
-         const sessionId = url.searchParams.get('session_id');
-         if (!sessionId) return new Response('Missing session_id', { status: 400 });
-
-         const doStub = getPollSession(env, sessionId);
-         return doStub.fetch(new Request('https://do/next', { method: 'GET' }));
-      }
-
-      // --- HTTP Polling: POST /v1/poll/respond (watchOS) ---
-      if (url.pathname === '/v1/poll/respond' && request.method === 'POST') {
-         const sessionId = url.searchParams.get('session_id');
-         if (!sessionId) return new Response('Missing session_id', { status: 400 });
-
-         const doStub = getPollSession(env, sessionId);
-         return doStub.fetch(new Request('https://do/respond', {
-            method: 'POST',
-            body: request.body,
-            headers: { 'Content-Type': 'application/json' },
+         const doUrl = `https://do/ws?videoID=${encodeURIComponent(videoID)}`;
+         return doStub.fetch(new Request(doUrl, {
+            headers: request.headers,
          }));
       }
 
       return new Response('Not found', { status: 404 });
    },
 } satisfies ExportedHandler<Env>;
-
-function getPollSession(env: Env, sessionId: string) {
-   const objectID = (env as any).POLL_SESSION.idFromName(sessionId);
-   return (env as any).POLL_SESSION.get(objectID);
-}
 
 function normalizeAppID(rawAppID: string | null): string {
    const trimmed = rawAppID?.trim();
