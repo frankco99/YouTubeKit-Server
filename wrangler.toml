@@ -2,35 +2,38 @@ name = "youtubekit-server"
 main = "src/index.ts"
 compatibility_date = "2025-05-03"
 
-# Limit CPU execution [in milliseconds]
 [limits]
 cpu_ms = 5000
 
 [observability]
 enabled = true
 
-# [placement]
-# mode = "smart"
-
-# Variables will be loaded from .dev.vars for local development
 [vars]
 RATE_LIMIT_DAILY_REQUESTS = "5000"
 RATE_LIMIT_WEEKLY_REQUESTS = "20000"
 
+# Existing rate limiter DO
 [[durable_objects.bindings]]
 name = "APP_RATE_LIMITER"
 class_name = "AppRateLimiter"
 
+# New: poll session DO (one instance per watchOS request)
+[[durable_objects.bindings]]
+name = "POLL_SESSION"
+class_name = "PollSessionObject"
+
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = [ "AppRateLimiter" ]
+new_sqlite_classes = ["AppRateLimiter"]
 
-
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PollSessionObject"]
 
 # Production environment --------------------------------------------------------
-
 [env.production]
 name = "youtubekit-server-production"
+
 [env.production.vars]
 RATE_LIMIT_DAILY_REQUESTS = "5000"
 RATE_LIMIT_WEEKLY_REQUESTS = "20000"
@@ -39,6 +42,14 @@ RATE_LIMIT_WEEKLY_REQUESTS = "20000"
 name = "APP_RATE_LIMITER"
 class_name = "AppRateLimiter"
 
+[[env.production.durable_objects.bindings]]
+name = "POLL_SESSION"
+class_name = "PollSessionObject"
+
 [[env.production.migrations]]
 tag = "v1"
-new_sqlite_classes = [ "AppRateLimiter" ]
+new_sqlite_classes = ["AppRateLimiter"]
+
+[[env.production.migrations]]
+tag = "v2"
+new_sqlite_classes = ["PollSessionObject"]
