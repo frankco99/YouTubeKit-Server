@@ -45,23 +45,27 @@ export class PollSessionObject extends DurableObject {
 
     while (Date.now() < deadline) {
       const phase = await this.getPhase();
+      console.log(`[next] phase=${phase}`);
 
       if (phase === 'pending_request') {
         const request = await this.ctx.storage.get<PollRequest>('pending_request');
         if (request) {
           await this.ctx.storage.delete('pending_request');
           await this.setPhase('waiting_for_response');
+          console.log(`[next] returning urlRequest id=${request.id}`);
           return Response.json({ type: 'urlRequest', content: request });
         }
       }
 
       if (phase === 'done') {
         const streams = await this.ctx.storage.get<any[]>('result');
+        console.log(`[next] returning result, streams=${streams?.length ?? 0}`);
         return Response.json({ type: 'result', content: streams ?? [] });
       }
 
       if (phase === 'error') {
         const msg = await this.ctx.storage.get<string>('error');
+        console.log(`[next] returning error: ${msg}`);
         return new Response(
           JSON.stringify({ type: 'error', message: msg ?? 'Unknown error' }),
           { status: 500, headers: { 'Content-Type': 'application/json' } }
@@ -71,26 +75,29 @@ export class PollSessionObject extends DurableObject {
       await sleep(300);
     }
 
+    console.log('[next] timeout, returning 204');
     return new Response(null, { status: 204 });
   }
 
   private async handleRespond(request: Request): Promise<Response> {
     const body = await request.json() as any;
     const phase = await this.getPhase();
+    console.log(`[respond] phase=${phase} id=${body.id}`);
 
     if (phase !== 'waiting_for_response') {
+      console.log(`[respond] unexpected phase, ignoring`);
       return new Response('Unexpected respond', { status: 409 });
     }
 
     await this.setPhase('waiting_for_request');
 
-    // Deliver to in-memory resolver if present (same instance)
     const resolver = this.pendingResponseResolvers.get(body.id);
     if (resolver) {
+      console.log(`[respond] found in-memory resolver for id=${body.id}`);
       this.pendingResponseResolvers.delete(body.id);
       resolver(body);
     } else {
-      // Store for fake socket to pick up (cross-request delivery)
+      console.log(`[respond] no resolver, storing response for id=${body.id}`);
       await this.ctx.storage.put(`response:${body.id}`, body);
     }
 
