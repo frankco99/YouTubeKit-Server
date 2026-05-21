@@ -130,6 +130,8 @@ export class PollSessionObject extends DurableObject {
         let parsed: any;
         try { parsed = JSON.parse(data); } catch { return; }
 
+        console.log(`[send] type=${parsed.type}`);
+
         if (parsed.type === 'urlRequest') {
           const request = parsed.content as PollRequest;
 
@@ -167,12 +169,16 @@ export class PollSessionObject extends DurableObject {
           );
 
         } else if (parsed.type === 'result') {
+          console.log(`[send] storing result, streams=${parsed.content?.length ?? 0}`);
           await self.ctx.storage.put('result', parsed.content);
           await self.setPhase('done');
+          console.log(`[send] phase set to done`);
 
         } else if (parsed.type === 'error') {
+          console.log(`[send] storing error: ${parsed.message}`);
           await self.ctx.storage.put('error', parsed.message ?? 'Unknown error');
           await self.setPhase('error');
+          console.log(`[send] phase set to error`);
         }
       },
 
