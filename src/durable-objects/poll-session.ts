@@ -2,11 +2,6 @@ import { DurableObject } from 'cloudflare:workers';
 import { PollRequest } from '../youtube/models/poll';
 import { YouTubeService } from '../youtube/service';
 
-/**
- * Uses DO Alarm to keep the instance alive.
- * Alarm fires every 25s, resetting itself — this prevents DO hibernation
- * while a session is active, ensuring in-memory state is preserved.
- */
 export class PollSessionObject extends DurableObject {
 
   private phase: 'idle' | 'pending_request' | 'waiting_for_response' | 'done' | 'error' = 'idle';
@@ -26,7 +21,6 @@ export class PollSessionObject extends DurableObject {
     return new Response('Not found', { status: 404 });
   }
 
-  // Alarm fires every 25s to keep DO alive
   async alarm() {
     if (this.sessionActive) {
       await this.ctx.storage.setAlarm(Date.now() + 25_000);
@@ -47,7 +41,6 @@ export class PollSessionObject extends DurableObject {
     this.pendingNextResolve = null;
     this.sessionActive = true;
 
-    // Set alarm to keep DO alive
     await this.ctx.storage.setAlarm(Date.now() + 25_000);
 
     const fakeSocket = this.buildFakeWebSocket();
@@ -66,30 +59,17 @@ export class PollSessionObject extends DurableObject {
   }
 
   private async handleNext(): Promise<Response> {
-    // If there's an active urlRequest not yet responded to, return it again
+    // Re-send pending urlRequest if client retrying
     if (this.phase === 'pending_request' && this.pendingRequest) {
       const req = this.pendingRequest;
-      // Don't clear pendingRequest — keep it until /respond comes in
       this.phase = 'waiting_for_response';
       console.log(`[next] urlRequest id=${req.id}`);
       return Response.json({ type: 'urlRequest', content: req });
     }
-    // If waiting_for_response, client already has the request — just wait
-    // Don't return anything new until /respond clears it
-    if (this.phase === 'waiting_for_response') {
-      // Re-send the same request if client lost it (retry scenario)
-      // We don't have it anymore after clearing — just wait for respond
-      const message = await new Promise<any>((resolve, reject) => {
-        this.pendingNextResolve = resolve;
-        setTimeout(() => {
-          this.pendingNextResolve = null;
-          reject(new Error('poll timeout'));
-        }, 50_000);
-      }).catch(() => null);
-
-      if (!message) return new Response(null, { status: 204 });
-      console.log(`[next] ${message.type}`);
-      return Response.json(message);
+    if (this.phase === 'waiting_for_response' && this.pendingRequest) {
+      // Client retrying after timeout — resend same request
+      console.log(`[next] re-send urlRequest id=${this.pendingRequest.id}`);
+      return Response.json({ type: 'urlRequest', content: this.pendingRequest });
     }
     if (this.phase === 'done') {
       console.log(`[next] result streams=${this.result?.length ?? 0}`);
@@ -99,7 +79,7 @@ export class PollSessionObject extends DurableObject {
       return Response.json({ type: 'error', message: this.errorMessage });
     }
 
-    // idle — wait for service to produce something
+    // Wait for service to produce something
     const message = await new Promise<any>((resolve, reject) => {
       this.pendingNextResolve = resolve;
       setTimeout(() => {
@@ -109,7 +89,7 @@ export class PollSessionObject extends DurableObject {
     }).catch(() => null);
 
     if (!message) return new Response(null, { status: 204 });
-    console.log(`[next] ${message.type}`);
+    console.log(`[next] ${message.type} ${message.content?.id ?? ''}`);
     return Response.json(message);
   }
 
@@ -135,7 +115,6 @@ export class PollSessionObject extends DurableObject {
       const resolve = this.pendingNextResolve;
       this.pendingNextResolve = null;
       if (message.type === 'urlRequest') {
-        // Store it so retry /next can re-send if needed
         this.phase = 'waiting_for_response';
         this.pendingRequest = message.content;
       }
@@ -193,6 +172,7 @@ export class PollSessionObject extends DurableObject {
             );
           }).catch(err => {
             console.error(`[send] timeout id=${req.id}:`, err.message);
+            self.notifyNext({ type: 'error', message: err.message });
           });
 
         } else if (parsed.type === 'result') {
