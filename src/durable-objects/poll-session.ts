@@ -66,12 +66,30 @@ export class PollSessionObject extends DurableObject {
   }
 
   private async handleNext(): Promise<Response> {
+    // If there's an active urlRequest not yet responded to, return it again
     if (this.phase === 'pending_request' && this.pendingRequest) {
       const req = this.pendingRequest;
-      this.pendingRequest = null;
+      // Don't clear pendingRequest — keep it until /respond comes in
       this.phase = 'waiting_for_response';
       console.log(`[next] urlRequest id=${req.id}`);
       return Response.json({ type: 'urlRequest', content: req });
+    }
+    // If waiting_for_response, client already has the request — just wait
+    // Don't return anything new until /respond clears it
+    if (this.phase === 'waiting_for_response') {
+      // Re-send the same request if client lost it (retry scenario)
+      // We don't have it anymore after clearing — just wait for respond
+      const message = await new Promise<any>((resolve, reject) => {
+        this.pendingNextResolve = resolve;
+        setTimeout(() => {
+          this.pendingNextResolve = null;
+          reject(new Error('poll timeout'));
+        }, 50_000);
+      }).catch(() => null);
+
+      if (!message) return new Response(null, { status: 204 });
+      console.log(`[next] ${message.type}`);
+      return Response.json(message);
     }
     if (this.phase === 'done') {
       console.log(`[next] result streams=${this.result?.length ?? 0}`);
@@ -81,6 +99,7 @@ export class PollSessionObject extends DurableObject {
       return Response.json({ type: 'error', message: this.errorMessage });
     }
 
+    // idle — wait for service to produce something
     const message = await new Promise<any>((resolve, reject) => {
       this.pendingNextResolve = resolve;
       setTimeout(() => {
@@ -90,7 +109,6 @@ export class PollSessionObject extends DurableObject {
     }).catch(() => null);
 
     if (!message) return new Response(null, { status: 204 });
-
     console.log(`[next] ${message.type}`);
     return Response.json(message);
   }
@@ -102,6 +120,7 @@ export class PollSessionObject extends DurableObject {
     const resolver = this.pendingResponseResolvers.get(body.id);
     if (resolver) {
       this.pendingResponseResolvers.delete(body.id);
+      this.pendingRequest = null;
       this.phase = 'idle';
       resolver(body);
     } else {
@@ -115,6 +134,11 @@ export class PollSessionObject extends DurableObject {
     if (this.pendingNextResolve) {
       const resolve = this.pendingNextResolve;
       this.pendingNextResolve = null;
+      if (message.type === 'urlRequest') {
+        // Store it so retry /next can re-send if needed
+        this.phase = 'waiting_for_response';
+        this.pendingRequest = message.content;
+      }
       resolve(message);
     } else {
       if (message.type === 'urlRequest') {
