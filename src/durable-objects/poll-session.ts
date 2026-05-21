@@ -2,22 +2,16 @@ import { DurableObject } from 'cloudflare:workers';
 import { PollRequest } from '../youtube/models/poll';
 import { YouTubeService } from '../youtube/service';
 
-/**
- * PollSessionObject
- *
- * Outbox (server → client): stored in DO storage so /next can read it
- * from any instance. Values are small JSON (urlRequest metadata only,
- * no body data).
- *
- * Inbox (client → server): kept in-memory because response bodies can
- * be >128KB (YouTube JS player), which exceeds SQLITE_TOOBIG limit.
- * This works because /respond and the service work() loop always run
- * in the same DO instance (same session UUID → same DO).
- */
 export class PollSessionObject extends DurableObject {
 
-  // In-memory inbox: response bodies from Watch → service
-  private inbox = new Map<string, (data: any) => void>();
+  // All state in-memory — DO stays alive via waitUntil + open /next request
+  private phase: 'idle' | 'pending_request' | 'waiting_for_response' | 'done' | 'error' = 'idle';
+  private pendingRequest: PollRequest | null = null;
+  private result: any[] | null = null;
+  private errorMessage: string | null = null;
+  private messageListeners = new Map<string, Set<(event: any) => void>>();
+  private pendingResponseResolvers = new Map<string, (msg: any) => void>();
+  private pendingNextResolve: ((msg: any) => void) | null = null;
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -32,18 +26,23 @@ export class PollSessionObject extends DurableObject {
     const videoId = url.searchParams.get('videoID');
     if (!videoId) return new Response('Missing videoID', { status: 400 });
 
-    await this.ctx.storage.deleteAll();
-    this.inbox.clear();
+    // Reset state
+    this.phase = 'idle';
+    this.pendingRequest = null;
+    this.result = null;
+    this.errorMessage = null;
+    this.messageListeners.clear();
+    this.pendingResponseResolvers.clear();
+    this.pendingNextResolve = null;
 
     const fakeSocket = this.buildFakeWebSocket();
     const service = new YouTubeService(videoId, fakeSocket);
 
+    // waitUntil keeps DO alive while service runs
     this.ctx.waitUntil(
-      service.start().catch(async err => {
+      service.start().catch(err => {
         console.error('[service] error:', err.message);
-        await this.ctx.storage.put('outbox', JSON.stringify({
-          type: 'error', message: err.message ?? 'Unknown error'
-        }));
+        this.notifyNext({ type: 'error', message: err.message ?? 'Unknown error' });
       })
     );
 
@@ -51,51 +50,86 @@ export class PollSessionObject extends DurableObject {
   }
 
   private async handleNext(): Promise<Response> {
-    const deadline = Date.now() + 50_000;
-
-    while (Date.now() < deadline) {
-      const raw = await this.ctx.storage.get<string>('outbox');
-      if (raw) {
-        const message = JSON.parse(raw);
-        console.log(`[next] type=${message.type}`);
-        if (message.type !== 'urlRequest') {
-          await this.ctx.storage.delete('outbox');
-        }
-        return Response.json(message);
-      }
-      await sleep(250);
+    // Already have something ready
+    if (this.phase === 'pending_request' && this.pendingRequest) {
+      const req = this.pendingRequest;
+      this.pendingRequest = null;
+      this.phase = 'waiting_for_response';
+      console.log(`[next] returning urlRequest id=${req.id}`);
+      return Response.json({ type: 'urlRequest', content: req });
+    }
+    if (this.phase === 'done') {
+      console.log(`[next] returning result streams=${this.result?.length ?? 0}`);
+      return Response.json({ type: 'result', content: this.result });
+    }
+    if (this.phase === 'error') {
+      console.log(`[next] returning error: ${this.errorMessage}`);
+      return Response.json({ type: 'error', message: this.errorMessage });
     }
 
-    return new Response(null, { status: 204 });
+    // Wait up to 50s for service to produce something
+    const message = await new Promise<any>((resolve, reject) => {
+      this.pendingNextResolve = resolve;
+      setTimeout(() => {
+        this.pendingNextResolve = null;
+        reject(new Error('poll timeout'));
+      }, 50_000);
+    }).catch(() => null);
+
+    if (!message) return new Response(null, { status: 204 });
+
+    if (message.type === 'urlRequest') {
+      console.log(`[next] returning urlRequest id=${message.content.id}`);
+    } else {
+      console.log(`[next] returning ${message.type}`);
+    }
+    return Response.json(message);
   }
 
   private async handleRespond(request: Request): Promise<Response> {
     const body = await request.json() as any;
     console.log(`[respond] id=${body.id}`);
 
-    // Clear outbox
-    await this.ctx.storage.delete('outbox');
-
-    // Deliver to in-memory resolver
-    const resolve = this.inbox.get(body.id);
-    if (resolve) {
-      this.inbox.delete(body.id);
-      resolve(body);
+    const resolver = this.pendingResponseResolvers.get(body.id);
+    if (resolver) {
+      this.pendingResponseResolvers.delete(body.id);
+      this.phase = 'idle';
+      resolver(body);
     } else {
-      console.warn(`[respond] no inbox resolver for id=${body.id}`);
+      console.warn(`[respond] no resolver for id=${body.id}`);
     }
 
     return new Response(null, { status: 204 });
   }
 
+  // Notify the waiting /next request
+  private notifyNext(message: any) {
+    if (this.pendingNextResolve) {
+      const resolve = this.pendingNextResolve;
+      this.pendingNextResolve = null;
+      resolve(message);
+    } else {
+      // /next not currently waiting — store for next poll
+      if (message.type === 'urlRequest') {
+        this.phase = 'pending_request';
+        this.pendingRequest = message.content;
+      } else if (message.type === 'result') {
+        this.phase = 'done';
+        this.result = message.content;
+      } else if (message.type === 'error') {
+        this.phase = 'error';
+        this.errorMessage = message.message;
+      }
+    }
+  }
+
   private buildFakeWebSocket(): WebSocket {
     const self = this;
-    const listeners = new Map<string, Set<(event: any) => void>>();
 
     const fakeSocket = {
       addEventListener(type: string, listener: (event: any) => void) {
-        if (!listeners.has(type)) listeners.set(type, new Set());
-        listeners.get(type)!.add(listener);
+        if (!self.messageListeners.has(type)) self.messageListeners.set(type, new Set());
+        self.messageListeners.get(type)!.add(listener);
       },
 
       send(data: string | ArrayBuffer) {
@@ -108,38 +142,36 @@ export class PollSessionObject extends DurableObject {
         if (parsed.type === 'urlRequest') {
           const req = parsed.content as PollRequest;
 
-          const work = async () => {
-            // Only store small metadata in outbox (no body data)
-            await self.ctx.storage.put('outbox', JSON.stringify({
-              type: 'urlRequest', content: req
-            }));
+          // Register resolver BEFORE notifying /next
+          const responsePromise = new Promise<any>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              self.pendingResponseResolvers.delete(req.id);
+              reject(new Error('Client fetch timeout'));
+            }, 55_000);
 
-            // Wait for /respond to deliver response via in-memory inbox
-            const responseData = await new Promise<any>((resolve, reject) => {
-              const timer = setTimeout(() => {
-                self.inbox.delete(req.id);
-                reject(new Error('Client fetch timeout'));
-              }, 55_000);
-
-              self.inbox.set(req.id, data => {
-                clearTimeout(timer);
-                resolve(data);
-              });
+            self.pendingResponseResolvers.set(req.id, data => {
+              clearTimeout(timer);
+              resolve(data);
             });
+          });
 
-            // Fire response back to YouTubeService
-            listeners.get('message')?.forEach(l =>
+          // Tell /next there's a urlRequest ready
+          self.notifyNext({ type: 'urlRequest', content: req });
+
+          // When /respond delivers response, fire to service
+          responsePromise.then(responseData => {
+            self.messageListeners.get('message')?.forEach(l =>
               l({ data: JSON.stringify(responseData) })
             );
-          };
+          }).catch(err => {
+            console.error(`[send] timeout for id=${req.id}:`, err.message);
+          });
 
-          work().catch(err => console.error('[send] work error:', err));
+        } else if (parsed.type === 'result') {
+          self.notifyNext({ type: 'result', content: parsed.content });
 
-        } else if (parsed.type === 'result' || parsed.type === 'error') {
-          // Store final result — small enough for storage
-          self.ctx.storage.put('outbox', data).catch(err =>
-            console.error('[send] storage error:', err)
-          );
+        } else if (parsed.type === 'error') {
+          self.notifyNext({ type: 'error', message: parsed.message ?? 'Unknown error' });
         }
       },
 
@@ -148,8 +180,4 @@ export class PollSessionObject extends DurableObject {
 
     return fakeSocket as unknown as WebSocket;
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
