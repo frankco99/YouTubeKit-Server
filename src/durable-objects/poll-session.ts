@@ -2,24 +2,12 @@ import { DurableObject } from 'cloudflare:workers';
 import { PollSession, PollSessionState, PollRequest } from '../youtube/models/poll';
 import { YouTubeService } from '../youtube/service';
 
-const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
 /**
- * PollSession Durable Object
- *
- * One instance per HTTP polling session (i.e. one Apple Watch request).
- * Holds the full session state and drives YouTubeService exactly like
- * the WebSocket path does — but instead of a real WebSocket it uses a
- * fake one backed by this Durable Object's storage.
- *
- * Client flow:
- *   POST /v1/poll/start?videoID=xxx   → { session_id }
- *   GET  /v1/poll/next?session_id=x   → ServerMessage JSON  (blocks up to 25s)
- *   POST /v1/poll/respond?session_id=x → client sends proxy response
+ * PollSessionObject Durable Object
+ * One instance per Apple Watch polling session, keyed by sessionId.
  */
 export class PollSessionObject extends DurableObject {
 
-  // Called by the Worker router to handle requests addressed to this DO
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -34,32 +22,28 @@ export class PollSessionObject extends DurableObject {
     return new Response('Not found', { status: 404 });
   }
 
-  // POST /start — initialize session and kick off YouTubeService
   private async handleStart(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const videoId = url.searchParams.get('videoID');
     if (!videoId) return new Response('Missing videoID', { status: 400 });
 
-    const sessionId = crypto.randomUUID();
-
+    // Initialize session state
     const session: PollSession = {
-      sessionId,
+      sessionId: this.ctx.id.toString(),
       videoId,
       state: { phase: 'waiting_for_request' },
       createdAt: Date.now(),
     };
     await this.ctx.storage.put('session', session);
 
-    // Start YouTubeService with a fake WebSocket that routes through this DO
+    // Start YouTubeService with fake WebSocket backed by this DO
     const fakeSocket = this.buildFakeWebSocket();
     const service = new YouTubeService(videoId, fakeSocket);
-    // Run in background — don't await
     this.ctx.waitUntil(service.start());
 
-    return Response.json({ session_id: sessionId });
+    return Response.json({ session_id: this.ctx.id.toString() });
   }
 
-  // GET /next — long-poll until state has a message for the client (up to 25s)
   private async handleNext(): Promise<Response> {
     const deadline = Date.now() + 25_000;
 
@@ -70,12 +54,7 @@ export class PollSessionObject extends DurableObject {
       const state = session.state;
 
       if (state.phase === 'pending_request') {
-        // Server wants client to execute an HTTP request
-        const message = {
-          type: 'urlRequest',
-          content: state.request,
-        };
-        // Transition to waiting_for_response
+        const message = { type: 'urlRequest', content: state.request };
         session.state = { phase: 'waiting_for_response', requestId: state.request.id };
         await this.ctx.storage.put('session', session);
         return Response.json(message);
@@ -92,31 +71,24 @@ export class PollSessionObject extends DurableObject {
         });
       }
 
-      // Still processing — wait 200ms and retry
       await sleep(200);
     }
 
-    // Timeout — tell client to retry immediately (204 = nothing yet)
     return new Response(null, { status: 204 });
   }
 
-  // POST /respond — client sends back the HTTP response it proxied
   private async handleRespond(request: Request): Promise<Response> {
     const body = await request.json() as any;
     const session = await this.ctx.storage.get<PollSession>('session');
     if (!session) return new Response('Session not found', { status: 404 });
 
-    // Deliver the response to the waiting inflightFetches resolver
-    const state = session.state;
-    if (state.phase !== 'waiting_for_response') {
+    if (session.state.phase !== 'waiting_for_response') {
       return new Response('Unexpected respond', { status: 409 });
     }
 
-    // Notify the fake WebSocket listener with the response
     this.pendingResponseResolvers.get(body.id)?.(body);
     this.pendingResponseResolvers.delete(body.id);
 
-    // Transition back to waiting for next request from service
     session.state = { phase: 'waiting_for_request' };
     await this.ctx.storage.put('session', session);
 
@@ -124,18 +96,11 @@ export class PollSessionObject extends DurableObject {
   }
 
   // - Fake WebSocket -
-  //
-  // YouTubeService expects a WebSocket. We give it a fake one that:
-  //   • send()     → stores an outgoing message so /next can return it
-  //   • message    → we fire when /respond delivers a proxied response
-  //   • close()    → no-op (session expires via TTL)
 
   private pendingResponseResolvers = new Map<string, (msg: any) => void>();
 
   private buildFakeWebSocket(): WebSocket {
     const self = this;
-
-    // We build a minimal duck-typed object that satisfies what YouTubeService needs.
     const listeners = new Map<string, Set<(event: any) => void>>();
 
     const fakeSocket = {
@@ -145,53 +110,37 @@ export class PollSessionObject extends DurableObject {
       },
 
       async send(data: string | ArrayBuffer) {
+        if (typeof data !== 'string') return;
+
+        let parsed: any;
+        try { parsed = JSON.parse(data); } catch { return; }
+
         const session = await self.ctx.storage.get<PollSession>('session');
         if (!session) return;
 
-        // YouTubeService sends two kinds of messages:
-        //   1. JSON ServerMessage<RemoteURLRequest> — forward to client via /next
-        //   2. JSON ServerMessage<result>           — forward to client via /next
-        let parsed: any;
-        if (typeof data === 'string') {
-          try { parsed = JSON.parse(data); } catch { return; }
-        } else {
-          // Binary (chunked) — shouldn't happen server→client, but handle gracefully
-          return;
-        }
-
         if (parsed.type === 'urlRequest') {
-          // Service wants client to fetch something — surface via /next
           session.state = { phase: 'pending_request', request: parsed.content as PollRequest };
           await self.ctx.storage.put('session', session);
 
-          // Also register a resolver so when /respond comes in we can notify service
           const requestId: string = parsed.content.id;
           const responsePromise = new Promise<any>(resolve => {
             self.pendingResponseResolvers.set(requestId, resolve);
           });
 
-          // Deliver response back to YouTubeService via fake message event
           responsePromise.then(responseData => {
-            const messageListeners = listeners.get('message');
-            if (messageListeners) {
-              const event = { data: JSON.stringify(responseData) };
-              messageListeners.forEach(l => l(event));
-            }
+            listeners.get('message')?.forEach(l => l({ data: JSON.stringify(responseData) }));
           });
 
-        } else if (parsed.type === 'result' || parsed.type === 'error') {
-          if (parsed.type === 'result') {
-            session.state = { phase: 'done', streams: parsed.content };
-          } else {
-            session.state = { phase: 'error', message: parsed.message ?? 'Unknown error' };
-          }
+        } else if (parsed.type === 'result') {
+          session.state = { phase: 'done', streams: parsed.content };
+          await self.ctx.storage.put('session', session);
+        } else if (parsed.type === 'error') {
+          session.state = { phase: 'error', message: parsed.message ?? 'Unknown error' };
           await self.ctx.storage.put('session', session);
         }
       },
 
-      close(_code?: number, _reason?: string) {
-        // no-op — session TTL handles cleanup
-      },
+      close(_code?: number, _reason?: string) { /* no-op */ },
     };
 
     return fakeSocket as unknown as WebSocket;
