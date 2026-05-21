@@ -29,8 +29,8 @@ export class PollSessionObject extends DurableObject {
     this.phase = 'waiting_for_request';
 
     const fakeSocket = this.buildFakeWebSocket();
-    // Pass native fetch — server fetches YouTube directly, no round-trip through Watch
-    const service = new YouTubeService(videoId, fakeSocket, fetch);
+    // Pass native fetch bound to globalThis — Cloudflare requires correct `this` reference
+    const service = new YouTubeService(videoId, fakeSocket, fetch.bind(globalThis));
     this.ctx.waitUntil(service.start());
 
     return new Response(null, { status: 204 });
