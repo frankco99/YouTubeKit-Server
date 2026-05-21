@@ -3,98 +3,106 @@ import { PollRequest } from '../youtube/models/poll';
 import { YouTubeService } from '../youtube/service';
 
 /**
- * PollSessionObject - uses DO WebSocket hibernation to stay alive.
+ * PollSessionObject - pure storage-based message queue.
  *
- * The client (Watch) opens a WebSocket to /ws, then the DO drives
- * YouTubeService with a fake fetch that routes urlRequests over that
- * same WebSocket. This way the DO is never evicted mid-session.
+ * NO in-memory state. Everything goes through DO storage.
+ * This means any DO instance can handle any request for the same session.
  *
- * Watch client flow:
- *   1. Open WS to /v1/poll/ws?videoID=xxx
- *   2. Receive messages: { type: "urlRequest", content: ... }
- *   3. Send back:        { id, url, status_code, headers, data(base64) }
- *   4. Receive final:    { type: "result", content: [...streams] }
+ * Storage keys:
+ *   service_started      : "1" once service.start() has been called
+ *   outbox               : JSON ServerMessage waiting for /next to pick up
+ *   inbox:{id}           : proxy response waiting for service to pick up
+ *   done                 : "1" when session complete
  */
 export class PollSessionObject extends DurableObject {
 
-  private messageListeners = new Map<string, Set<(event: any) => void>>();
-  private pendingResponseResolvers = new Map<string, (msg: any) => void>();
-  private clientSocket: WebSocket | null = null;
-
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-
-    if (url.pathname === '/ws') {
-      return this.handleWebSocket(request);
-    }
-
+    if (url.pathname === '/start')   return this.handleStart(request);
+    if (url.pathname === '/next')    return this.handleNext();
+    if (url.pathname === '/respond') return this.handleRespond(request);
     return new Response('Not found', { status: 404 });
   }
 
-  // Upgrade to WebSocket — DO stays alive as long as WS is open
-  private async handleWebSocket(request: Request): Promise<Response> {
+  // POST /start — kick off YouTubeService in this request's context
+  private async handleStart(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const videoId = url.searchParams.get('videoID');
     if (!videoId) return new Response('Missing videoID', { status: 400 });
 
-    if (request.headers.get('Upgrade') !== 'websocket') {
-      return new Response('Expected WebSocket', { status: 426 });
-    }
+    // Clear any old state
+    await this.ctx.storage.deleteAll();
 
-    const [clientSock, serverSock] = Object.values(new WebSocketPair());
-    this.ctx.acceptWebSocket(serverSock);
-    this.clientSocket = serverSock;
-
-    // Start YouTubeService — DO stays alive because WebSocket is open
-    const fakeSocket = this.buildFakeWebSocket(serverSock);
+    // Build fake socket and run service — service will block on each wsFetch
+    // until /respond delivers the response via storage
+    const fakeSocket = this.buildFakeWebSocket();
     const service = new YouTubeService(videoId, fakeSocket);
 
+    // Run service in background — DO stays alive via waitUntil
     this.ctx.waitUntil(
-      service.start().catch(err => {
-        console.error('[service] error:', err);
-        try {
-          serverSock.send(JSON.stringify({ type: 'error', message: err.message ?? 'Unknown error' }));
-          serverSock.close();
-        } catch {}
+      service.start().catch(async err => {
+        console.error('[service] error:', err.message);
+        await this.ctx.storage.put('outbox', JSON.stringify({
+          type: 'error', message: err.message ?? 'Unknown error'
+        }));
       })
     );
 
-    return new Response(null, { status: 101, webSocket: clientSock });
+    return new Response(null, { status: 204 });
   }
 
-  // Called by Cloudflare when DO receives a WS message (hibernation-safe)
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-    if (typeof message !== 'string') return;
-    let parsed: any;
-    try { parsed = JSON.parse(message); } catch { return; }
+  // GET /next — poll outbox until message appears (up to 50s)
+  private async handleNext(): Promise<Response> {
+    const deadline = Date.now() + 50_000;
 
-    console.log(`[ws message] id=${parsed.id}`);
-    const resolver = this.pendingResponseResolvers.get(parsed.id);
-    if (resolver) {
-      this.pendingResponseResolvers.delete(parsed.id);
-      resolver(parsed);
-    } else {
-      console.warn(`[ws message] no resolver for id=${parsed.id}`);
+    while (Date.now() < deadline) {
+      const raw = await this.ctx.storage.get<string>('outbox');
+      if (raw) {
+        const message = JSON.parse(raw);
+        console.log(`[next] type=${message.type}`);
+
+        if (message.type === 'urlRequest') {
+          // Keep outbox set so if client crashes it can retry
+          // Client must call /respond to clear it
+          return Response.json(message);
+        }
+
+        // result or error — clear and return
+        await this.ctx.storage.delete('outbox');
+        return Response.json(message);
+      }
+
+      await sleep(250);
     }
+
+    return new Response(null, { status: 204 });
   }
 
-  async webSocketClose(ws: WebSocket, code: number, reason: string) {
-    console.log(`[ws close] code=${code} reason=${reason}`);
+  // POST /respond — put response in inbox for service to pick up
+  private async handleRespond(request: Request): Promise<Response> {
+    const body = await request.json() as any;
+    console.log(`[respond] id=${body.id}`);
+
+    // Clear outbox (urlRequest has been handled)
+    await this.ctx.storage.delete('outbox');
+    // Put response in inbox
+    await this.ctx.storage.put(`inbox:${body.id}`, JSON.stringify(body));
+
+    return new Response(null, { status: 204 });
   }
 
-  async webSocketError(ws: WebSocket, error: unknown) {
-    console.error('[ws error]', error);
-  }
-
-  private buildFakeWebSocket(serverSock: WebSocket): WebSocket {
+  // Fake WebSocket — all communication via DO storage
+  private buildFakeWebSocket(): WebSocket {
     const self = this;
+    const listeners = new Map<string, Set<(event: any) => void>>();
 
     const fakeSocket = {
       addEventListener(type: string, listener: (event: any) => void) {
-        if (!self.messageListeners.has(type)) self.messageListeners.set(type, new Set());
-        self.messageListeners.get(type)!.add(listener);
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type)!.add(listener);
       },
 
+      // YouTubeService calls send() synchronously — we handle async internally
       send(data: string | ArrayBuffer) {
         if (typeof data !== 'string') return;
         let parsed: any;
@@ -105,47 +113,50 @@ export class PollSessionObject extends DurableObject {
         if (parsed.type === 'urlRequest') {
           const req = parsed.content as PollRequest;
 
-          // Register resolver before sending to client
-          const responsePromise = new Promise<any>((resolve, reject) => {
-            const timer = setTimeout(() => {
-              self.pendingResponseResolvers.delete(req.id);
-              reject(new Error('Client fetch timeout'));
-            }, 55_000);
+          // Write urlRequest to outbox — /next will pick it up
+          // Then wait for /respond to put response in inbox
+          const work = async () => {
+            await self.ctx.storage.put('outbox', JSON.stringify({
+              type: 'urlRequest', content: req
+            }));
 
-            self.pendingResponseResolvers.set(req.id, data => {
-              clearTimeout(timer);
-              resolve(data);
-            });
-          });
+            // Poll inbox until response arrives (up to 55s)
+            const deadline = Date.now() + 55_000;
+            while (Date.now() < deadline) {
+              const raw = await self.ctx.storage.get<string>(`inbox:${req.id}`);
+              if (raw) {
+                await self.ctx.storage.delete(`inbox:${req.id}`);
+                const responseData = JSON.parse(raw);
+                // Fire response back to YouTubeService
+                listeners.get('message')?.forEach(l =>
+                  l({ data: JSON.stringify(responseData) })
+                );
+                return;
+              }
+              await sleep(250);
+            }
+            console.error(`[send] inbox timeout for id=${req.id}`);
+          };
 
-          // Send urlRequest to Watch client over WebSocket
-          try {
-            serverSock.send(JSON.stringify({ type: 'urlRequest', content: req }));
-          } catch (e) {
-            console.error('[send] failed to send urlRequest:', e);
-          }
-
-          // When Watch responds, fire it back to YouTubeService
-          responsePromise.then(responseData => {
-            self.messageListeners.get('message')?.forEach(l =>
-              l({ data: JSON.stringify(responseData) })
-            );
-          }).catch(err => {
-            console.error(`[send] timeout for id=${req.id}:`, err);
-          });
+          // We can't await here (send is sync), so fire and forget
+          // The Promise keeps this DO alive via the event loop
+          work().catch(err => console.error('[send] work error:', err));
 
         } else if (parsed.type === 'result' || parsed.type === 'error') {
-          // Forward final result/error to Watch, then close
-          try {
-            serverSock.send(data);
-            serverSock.close();
-          } catch {}
+          // Write final result/error to outbox for /next to return
+          self.ctx.storage.put('outbox', data).catch(err =>
+            console.error('[send] storage error:', err)
+          );
         }
       },
 
-      close(_code?: number, _reason?: string) { /* no-op */ },
+      close() { /* no-op */ },
     };
 
     return fakeSocket as unknown as WebSocket;
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
