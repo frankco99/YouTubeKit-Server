@@ -3,18 +3,21 @@ import { PollRequest } from '../youtube/models/poll';
 import { YouTubeService } from '../youtube/service';
 
 /**
- * PollSessionObject - pure storage-based message queue.
+ * PollSessionObject
  *
- * NO in-memory state. Everything goes through DO storage.
- * This means any DO instance can handle any request for the same session.
+ * Outbox (server → client): stored in DO storage so /next can read it
+ * from any instance. Values are small JSON (urlRequest metadata only,
+ * no body data).
  *
- * Storage keys:
- *   service_started      : "1" once service.start() has been called
- *   outbox               : JSON ServerMessage waiting for /next to pick up
- *   inbox:{id}           : proxy response waiting for service to pick up
- *   done                 : "1" when session complete
+ * Inbox (client → server): kept in-memory because response bodies can
+ * be >128KB (YouTube JS player), which exceeds SQLITE_TOOBIG limit.
+ * This works because /respond and the service work() loop always run
+ * in the same DO instance (same session UUID → same DO).
  */
 export class PollSessionObject extends DurableObject {
+
+  // In-memory inbox: response bodies from Watch → service
+  private inbox = new Map<string, (data: any) => void>();
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -24,21 +27,17 @@ export class PollSessionObject extends DurableObject {
     return new Response('Not found', { status: 404 });
   }
 
-  // POST /start — kick off YouTubeService in this request's context
   private async handleStart(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const videoId = url.searchParams.get('videoID');
     if (!videoId) return new Response('Missing videoID', { status: 400 });
 
-    // Clear any old state
     await this.ctx.storage.deleteAll();
+    this.inbox.clear();
 
-    // Build fake socket and run service — service will block on each wsFetch
-    // until /respond delivers the response via storage
     const fakeSocket = this.buildFakeWebSocket();
     const service = new YouTubeService(videoId, fakeSocket);
 
-    // Run service in background — DO stays alive via waitUntil
     this.ctx.waitUntil(
       service.start().catch(async err => {
         console.error('[service] error:', err.message);
@@ -51,7 +50,6 @@ export class PollSessionObject extends DurableObject {
     return new Response(null, { status: 204 });
   }
 
-  // GET /next — poll outbox until message appears (up to 50s)
   private async handleNext(): Promise<Response> {
     const deadline = Date.now() + 50_000;
 
@@ -60,38 +58,36 @@ export class PollSessionObject extends DurableObject {
       if (raw) {
         const message = JSON.parse(raw);
         console.log(`[next] type=${message.type}`);
-
-        if (message.type === 'urlRequest') {
-          // Keep outbox set so if client crashes it can retry
-          // Client must call /respond to clear it
-          return Response.json(message);
+        if (message.type !== 'urlRequest') {
+          await this.ctx.storage.delete('outbox');
         }
-
-        // result or error — clear and return
-        await this.ctx.storage.delete('outbox');
         return Response.json(message);
       }
-
       await sleep(250);
     }
 
     return new Response(null, { status: 204 });
   }
 
-  // POST /respond — put response in inbox for service to pick up
   private async handleRespond(request: Request): Promise<Response> {
     const body = await request.json() as any;
     console.log(`[respond] id=${body.id}`);
 
-    // Clear outbox (urlRequest has been handled)
+    // Clear outbox
     await this.ctx.storage.delete('outbox');
-    // Put response in inbox
-    await this.ctx.storage.put(`inbox:${body.id}`, JSON.stringify(body));
+
+    // Deliver to in-memory resolver
+    const resolve = this.inbox.get(body.id);
+    if (resolve) {
+      this.inbox.delete(body.id);
+      resolve(body);
+    } else {
+      console.warn(`[respond] no inbox resolver for id=${body.id}`);
+    }
 
     return new Response(null, { status: 204 });
   }
 
-  // Fake WebSocket — all communication via DO storage
   private buildFakeWebSocket(): WebSocket {
     const self = this;
     const listeners = new Map<string, Set<(event: any) => void>>();
@@ -102,7 +98,6 @@ export class PollSessionObject extends DurableObject {
         listeners.get(type)!.add(listener);
       },
 
-      // YouTubeService calls send() synchronously — we handle async internally
       send(data: string | ArrayBuffer) {
         if (typeof data !== 'string') return;
         let parsed: any;
@@ -113,37 +108,35 @@ export class PollSessionObject extends DurableObject {
         if (parsed.type === 'urlRequest') {
           const req = parsed.content as PollRequest;
 
-          // Write urlRequest to outbox — /next will pick it up
-          // Then wait for /respond to put response in inbox
           const work = async () => {
+            // Only store small metadata in outbox (no body data)
             await self.ctx.storage.put('outbox', JSON.stringify({
               type: 'urlRequest', content: req
             }));
 
-            // Poll inbox until response arrives (up to 55s)
-            const deadline = Date.now() + 55_000;
-            while (Date.now() < deadline) {
-              const raw = await self.ctx.storage.get<string>(`inbox:${req.id}`);
-              if (raw) {
-                await self.ctx.storage.delete(`inbox:${req.id}`);
-                const responseData = JSON.parse(raw);
-                // Fire response back to YouTubeService
-                listeners.get('message')?.forEach(l =>
-                  l({ data: JSON.stringify(responseData) })
-                );
-                return;
-              }
-              await sleep(250);
-            }
-            console.error(`[send] inbox timeout for id=${req.id}`);
+            // Wait for /respond to deliver response via in-memory inbox
+            const responseData = await new Promise<any>((resolve, reject) => {
+              const timer = setTimeout(() => {
+                self.inbox.delete(req.id);
+                reject(new Error('Client fetch timeout'));
+              }, 55_000);
+
+              self.inbox.set(req.id, data => {
+                clearTimeout(timer);
+                resolve(data);
+              });
+            });
+
+            // Fire response back to YouTubeService
+            listeners.get('message')?.forEach(l =>
+              l({ data: JSON.stringify(responseData) })
+            );
           };
 
-          // We can't await here (send is sync), so fire and forget
-          // The Promise keeps this DO alive via the event loop
           work().catch(err => console.error('[send] work error:', err));
 
         } else if (parsed.type === 'result' || parsed.type === 'error') {
-          // Write final result/error to outbox for /next to return
+          // Store final result — small enough for storage
           self.ctx.storage.put('outbox', data).catch(err =>
             console.error('[send] storage error:', err)
           );
