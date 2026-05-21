@@ -1,4 +1,4 @@
-name = "youtubekitserver"
+name = "youtubekit-server"
 main = "src/index.ts"
 compatibility_date = "2025-05-03"
 
@@ -9,8 +9,8 @@ cpu_ms = 5000
 enabled = true
 
 [vars]
-RATE_LIMIT_DAILY_REQUESTS = "5000"
-RATE_LIMIT_WEEKLY_REQUESTS = "20000"
+RATE_LIMIT_DAILY_REQUESTS = "500000"
+RATE_LIMIT_WEEKLY_REQUESTS = "2000000"
 
 # Existing rate limiter DO
 [[durable_objects.bindings]]
@@ -35,8 +35,8 @@ new_sqlite_classes = ["PollSessionObject"]
 name = "youtubekit-server-production"
 
 [env.production.vars]
-RATE_LIMIT_DAILY_REQUESTS = "5000"
-RATE_LIMIT_WEEKLY_REQUESTS = "20000"
+RATE_LIMIT_DAILY_REQUESTS = "500000"
+RATE_LIMIT_WEEKLY_REQUESTS = "2000000"
 
 [[env.production.durable_objects.bindings]]
 name = "APP_RATE_LIMITER"
