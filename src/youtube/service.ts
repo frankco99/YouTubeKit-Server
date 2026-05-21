@@ -16,9 +16,13 @@ export class YouTubeService {
    // Fixed 12-byte header: packetId (4), chunkIndex (4), totalChunks (4)
    private static readonly CHUNK_HEADER_SIZE = 12;
 
-   constructor(videoID: string, websocket: WebSocket) {
+   // If provided, use this fetch instead of routing through client (used by HTTP polling)
+   private directFetch: typeof fetch | undefined;
+
+   constructor(videoID: string, websocket: WebSocket, directFetch?: typeof fetch) {
       this.videoID = videoID;
       this.websocket = websocket;
+      this.directFetch = directFetch;
    }
 
    private send(data: ServerMessage<any>) {
@@ -26,7 +30,9 @@ export class YouTubeService {
    }
 
    async start() {
-      const wsFetch: typeof fetch = async (input, init = {}) => {
+      // If directFetch is provided (HTTP polling path), use it directly —
+      // no need to round-trip through the client device for each YouTube request.
+      const wsFetch: typeof fetch = this.directFetch ?? (async (input, init = {}) => {
          const req = new Request(input, init);
          const id = crypto.randomUUID();
 
@@ -41,14 +47,13 @@ export class YouTubeService {
             allow_redirects: true,
             apply_cookies_on_redirect: true,
             save_intermediate_responses: false,
-            max_message_chunk_size: 900 * 1024, // 900kB (maximum on Cloudflare is 1MB in total)
+            max_message_chunk_size: 900 * 1024,
          };
 
          this.send({ type: ServerMessageType.urlRequest, content: payload });
 
-         // Wait for the matching response
          const responsePromise = new Promise<RemoteURLResponse>((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('Client fetch timeout')), 30_000);
+            const timer = setTimeout(() => reject(new Error('Client fetch timeout')), 55_000);
             this.inflightFetches.set(id, msg => {
                clearTimeout(timer);
                resolve(msg);
@@ -58,18 +63,17 @@ export class YouTubeService {
          const resMsg = await responsePromise;
          const binary = Uint8Array.from(atob(resMsg.data), c => c.charCodeAt(0));
          return new Response(binary, { status: resMsg.status_code, headers: resMsg.headers });
-      };
+      });
 
-      // Listen for messages from client
+      // Listen for messages from client (only needed for WebSocket path)
       this.websocket.addEventListener('message', async event => {
          try {
-            const data: any = event.data; // Explicitly cast to any for instanceof checks
+            const data: any = event.data;
 
             if (data instanceof ArrayBuffer) {
                if (data.byteLength >= YouTubeService.CHUNK_HEADER_SIZE) {
                   await this.handleChunk(data);
                } else {
-                  console.warn(`Received small ArrayBuffer (size: ${data.byteLength}), processing as non-chunked.`);
                   this.processCompleteMessage(new TextDecoder().decode(data));
                }
             } else if (data instanceof Blob) {
@@ -77,24 +81,17 @@ export class YouTubeService {
                if (arrayBuffer.byteLength >= YouTubeService.CHUNK_HEADER_SIZE) {
                   await this.handleChunk(arrayBuffer);
                } else {
-                  console.warn(`Received small Blob message (size: ${arrayBuffer.byteLength}), processing as non-chunked.`);
                   this.processCompleteMessage(new TextDecoder().decode(arrayBuffer));
                }
             } else if (typeof data === 'string') {
-               // Should ideally not happen if client always sends ArrayBuffer for chunked
-               console.warn('Received unexpected string message, processing as non-chunked.');
                this.processCompleteMessage(data);
-            } else {
-               console.error('Received unexpected message data type:', typeof data);
             }
          } catch (error: any) {
             console.error('Error processing message from client:', error);
-            // Consider adding cleanup logic here or a timeout mechanism for stale buffers
          }
       });
 
       try {
-         // Configure JavaScript evaluator for deciphering using QuickJS
          Platform.shim.eval = async (data, env) => {
             return await evaluateJavaScript(data, env);
          };
@@ -115,8 +112,6 @@ export class YouTubeService {
       }
    }
 
-   // - Chunk Handling Methods (Updated for Fixed 12-byte Header) -
-
    private async handleChunk(chunkData: ArrayBuffer): Promise<void> {
       if (chunkData.byteLength < YouTubeService.CHUNK_HEADER_SIZE) {
          console.error(`Chunk too small for header (size: ${chunkData.byteLength}, needed: ${YouTubeService.CHUNK_HEADER_SIZE})`);
@@ -126,125 +121,80 @@ export class YouTubeService {
       let packetId: number | undefined;
 
       try {
-         // 1. Read Packet Identifier (UInt32 BE)
-         packetId = headerView.getUint32(0, false); // false for big-endian
-         const packetIdStr = packetId.toString(); // Use string for map key
-
-         // 2. Read Chunk Index (UInt32 BE)
+         packetId = headerView.getUint32(0, false);
+         const packetIdStr = packetId.toString();
          const chunkIndex = headerView.getUint32(4, false);
-
-         // 3. Read Total Chunks (UInt32 BE)
          const totalChunks = headerView.getUint32(8, false);
-
-         // 4. Extract Payload
          const payload = chunkData.slice(YouTubeService.CHUNK_HEADER_SIZE);
 
-         // console.log(`Received chunk ${chunkIndex + 1}/${totalChunks} for Packet ID ${packetIdStr}, size ${payload.byteLength}`); // DEBUG
-
-         // --- State Management ---
          let state = this.chunkBuffers.get(packetIdStr);
 
          if (chunkIndex === 0) {
-            if (state && state.receivedCount > 0) {
-               console.warn(`Received chunk 0 for Packet ID ${packetIdStr} while previous msg incomplete. Resetting.`);
-            }
             state = { buffer: new Array(totalChunks), expectedTotal: totalChunks, receivedCount: 0 };
             this.chunkBuffers.set(packetIdStr, state);
          } else if (!state) {
-            console.error(`Received chunk ${chunkIndex + 1} for unknown/expired Packet ID ${packetIdStr}. Discarding.`);
             return;
          }
 
          if (totalChunks !== state.expectedTotal) {
-            console.error(
-               `Chunk total mismatch for Packet ID ${packetIdStr}: received ${totalChunks}, expected ${state.expectedTotal}. Discarding buffer.`
-            );
             this.chunkBuffers.delete(packetIdStr);
             return;
          }
 
-         if (chunkIndex >= state.expectedTotal || state.buffer[chunkIndex]) {
-            console.warn(`Duplicate or invalid chunk index ${chunkIndex + 1} for Packet ID ${packetIdStr}. Ignoring.`);
-            return;
-         }
+         if (chunkIndex >= state.expectedTotal || state.buffer[chunkIndex]) return;
 
-         // Store chunk & update count
          state.buffer[chunkIndex] = payload;
          state.receivedCount++;
 
-         // Check completion
          if (state.receivedCount === state.expectedTotal) {
-            // console.log(`Message complete for Packet ID ${packetIdStr}. Reassembling.`); // DEBUG
             await this.reassembleAndProcess(packetIdStr);
          }
       } catch (error: any) {
          console.error('Error handling chunk:', error);
-         if (packetId !== undefined && this.chunkBuffers.has(packetId.toString())) {
-            console.log(`Cleaning up buffer for Packet ID ${packetId} due to error.`);
-            this.chunkBuffers.delete(packetId.toString());
-         }
+         if (packetId !== undefined) this.chunkBuffers.delete(packetId.toString());
       }
    }
 
    private async reassembleAndProcess(packetIdStr: string): Promise<void> {
       const state = this.chunkBuffers.get(packetIdStr);
-      if (!state) {
-         console.error(`Attempted to reassemble non-existent Packet ID: ${packetIdStr}`);
-         return;
-      }
+      if (!state) return;
 
       try {
-         // Verify all chunks are present before assembling
          for (let i = 0; i < state.expectedTotal; i++) {
-            if (!state.buffer[i]) {
-               throw new Error(`Missing chunk ${i + 1} during final reassembly for Packet ID ${packetIdStr}`);
-            }
+            if (!state.buffer[i]) throw new Error(`Missing chunk ${i + 1}`);
          }
-
          const completeBuffer = await this.reassembleChunks(state.buffer);
-         const messageData = new TextDecoder().decode(completeBuffer);
-         this.processCompleteMessage(messageData);
+         this.processCompleteMessage(new TextDecoder().decode(completeBuffer));
       } catch (e) {
-         console.error(`Failed to reassemble or process Packet ID ${packetIdStr}:`, e);
+         console.error(`Failed to reassemble Packet ID ${packetIdStr}:`, e);
       } finally {
-         // Always remove buffer after processing attempt
          this.chunkBuffers.delete(packetIdStr);
       }
    }
 
    private async reassembleChunks(buffer: ArrayBuffer[]): Promise<ArrayBuffer> {
-      // Calculate total size
       const totalSize = buffer.reduce((sum, chunk) => sum + chunk.byteLength, 0);
       const reassembled = new Uint8Array(totalSize);
       let offset = 0;
       for (const chunk of buffer) {
-         // Already validated chunks exist in reassembleAndProcess
          reassembled.set(new Uint8Array(chunk), offset);
          offset += chunk.byteLength;
       }
       return reassembled.buffer;
    }
 
-   // Processes a fully reassembled message string
    private processCompleteMessage(messageData: string): void {
-      // console.log('Processing complete message:', messageData.substring(0, 100) + '...'); // DEBUG
       try {
          const parsed = JSON.parse(messageData) as RemoteURLResponse;
          const callback = this.inflightFetches.get(parsed.id);
          if (callback) {
-            // Note: The message ID (parsed.id) inside the JSON payload is the one
-            // used for matching the original request, NOT the packetId used for chunking.
             this.inflightFetches.delete(parsed.id);
             callback(parsed);
-         } else {
-            console.warn(`Received response for unknown or timed out request ID: ${parsed.id}`);
          }
       } catch (error: any) {
-         console.error('Bad message format or JSON parse error:', error, 'Data:', messageData.substring(0, 200) + '...');
+         console.error('Bad message format:', error);
       }
    }
-
-   // - InnerTube Methods -
 
    private async getStreams(innertube: Innertube): Promise<RemoteStream[]> {
       const clients: AvailableInnertubeClient[] = ['ANDROID_VR', 'WEB'];
@@ -260,9 +210,6 @@ export class YouTubeService {
             console.error(`Failed to get streams for client ${client}:`, error);
          }
       }
-
-      // TODO: remove duplicate itags
-      // TODO: parallelize it
 
       if (allStreams.length === 0) {
          try {
@@ -280,7 +227,6 @@ export class YouTubeService {
       const f = info.streaming_data || { formats: [], adaptive_formats: [] };
       const formats = [...(f.formats ?? []), ...(f.adaptive_formats ?? [])];
 
-      // Process formats in batches to reduce memory pressure (avoids exceeding 128MB limit)
       const BATCH_SIZE = 5;
       const streamsOrNull: (RemoteStream | null)[] = [];
 
@@ -292,35 +238,22 @@ export class YouTubeService {
                try {
                   deciphered = await format.decipher(innertube.session.player);
                } catch (error) {
-                  console.log('decipher error:', error);
                   deciphered = undefined;
                }
 
-               const streamUrl = deciphered ?? ((format as any).deciphered_url as string | undefined); // ?? format.url;
-
-               if (!streamUrl) {
-                  return null;
-               }
-
-               if (format.is_dubbed) {
-                  console.log('Skip dubbed streams');
-                  return null;
-               }
+               const streamUrl = deciphered ?? ((format as any).deciphered_url as string | undefined);
+               if (!streamUrl) return null;
+               if (format.is_dubbed) return null;
 
                let mimeType = format.mime_type;
-               let videoCodec: string | undefined = undefined;
-               let audioCodec: string | undefined = undefined;
+               let videoCodec: string | undefined;
+               let audioCodec: string | undefined;
 
                if (mimeType?.includes('codecs=')) {
                   const codecString = mimeType.split('codecs=')[1]?.replace(/"/g, '') || '';
-                  // Split by comma and potential space
-                  const codecs = codecString
-                     .split(',')
-                     .map(c => c.trim())
-                     .filter(c => c.length > 0);
+                  const codecs = codecString.split(',').map(c => c.trim()).filter(c => c.length > 0);
 
                   if (format.has_video && format.has_audio && codecs.length >= 2) {
-                     // Assuming the typical order is video, then audio
                      videoCodec = codecs[0];
                      audioCodec = codecs[1];
                   } else if (format.has_video && codecs.length >= 1) {
@@ -328,11 +261,10 @@ export class YouTubeService {
                   } else if (format.has_audio && codecs.length >= 1) {
                      audioCodec = codecs[0];
                   }
-
-                  mimeType = mimeType.split(';')[0]; // remove codec info
+                  mimeType = mimeType.split(';')[0];
                }
 
-               const stream: RemoteStream = {
+               return {
                   url: streamUrl,
                   itag: format.itag,
                   ext: fileExtensionFromMimeType(mimeType),
@@ -342,16 +274,12 @@ export class YouTubeService {
                   audio_bitrate: format.has_audio ? format.bitrate : undefined,
                   video_bitrate: format.has_video ? format.bitrate : undefined,
                   filesize: format.content_length ? Number(format.content_length) : undefined,
-               };
-               return stream;
+               } as RemoteStream;
             })
          );
-
          streamsOrNull.push(...batchResults);
       }
 
-      const filteredStreams = streamsOrNull.filter((stream): stream is RemoteStream => stream !== null);
-
-      return filteredStreams;
+      return streamsOrNull.filter((s): s is RemoteStream => s !== null);
    }
 }
